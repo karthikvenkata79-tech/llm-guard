@@ -23,7 +23,10 @@ use once_cell::sync::{Lazy, OnceCell};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::sync::Arc;
+use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 // ============================================================================
@@ -37,6 +40,10 @@ pub struct Config {
     pub block_on_detect: bool,
     pub scan_response: bool,
     pub rules_file: Option<String>,
+    /// LLM10: max requests per client per 60s (0 = disabled).
+    pub rate_limit: u32,
+    /// LLM07: if the reply contains this string, treat it as a system-prompt leak.
+    pub system_prompt_canary: Option<String>,
 }
 
 impl Config {
@@ -53,6 +60,13 @@ impl Config {
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(true),
             rules_file: std::env::var("GUARD_RULES_FILE").ok(),
+            rate_limit: std::env::var("GUARD_RATE_LIMIT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60),
+            system_prompt_canary: std::env::var("GUARD_SYSTEM_PROMPT_CANARY")
+                .ok()
+                .filter(|s| !s.is_empty()),
         }
     }
 }
@@ -250,7 +264,7 @@ pub fn scan(text: &str) -> Vec<Finding> {
                 category: rule.category.to_string(),
                 rule: rule.name.to_string(),
                 severity: rule.severity,
-                snippet: truncate(m.as_str(), 60),
+                snippet: safe_snippet(rule.category, m.as_str()),
             });
         }
     }
@@ -279,7 +293,7 @@ pub fn redact(text: &str) -> (String, Vec<Finding>) {
                 category: rule.category.to_string(),
                 rule: rule.name.to_string(),
                 severity: rule.severity,
-                snippet: truncate(m.as_str(), 60),
+                snippet: safe_snippet(rule.category, m.as_str()),
             })
             .collect();
 
@@ -298,6 +312,17 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         let taken: String = s.chars().take(max).collect();
         format!("{taken}…")
+    }
+}
+
+/// Build a log-safe snippet. For secrets and PII we must NOT log the real value
+/// (that would leak into the audit log the very thing we redact), so we record
+/// only its length. Injection/unsafe-output text is safe and useful to keep.
+fn safe_snippet(category: &str, matched: &str) -> String {
+    if category == "secret" || category == "pii" {
+        format!("[{} chars hidden]", matched.chars().count())
+    } else {
+        truncate(matched, 60)
     }
 }
 
@@ -407,6 +432,17 @@ fn augment_for_scanning(text: &str) -> String {
 
 async fn handle(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     let start = Instant::now();
+
+    // LLM10 (Unbounded Consumption): rate-limit each client before any work.
+    if !allow_request(&state, client_key(&headers)) {
+        tracing::warn!(target: "audit", "request RATE LIMITED (429)");
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({ "error": "rate limit exceeded" })),
+        )
+            .into_response();
+    }
+
     let body_str = String::from_utf8_lossy(&body).to_string();
 
     let scan_target = extract_prompt_text(&body_str).unwrap_or_else(|| body_str.clone());
@@ -467,7 +503,7 @@ async fn handle(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
     match forward(&state, &headers, clean_body).await {
         Ok((status, upstream_bytes)) => {
             let (out_bytes, out_redactions) = if state.config.scan_response {
-                redact_response_body(&upstream_bytes)
+                redact_response_body(&upstream_bytes, state.config.system_prompt_canary.as_deref())
             } else {
                 (upstream_bytes, Vec::new())
             };
@@ -534,8 +570,9 @@ fn redact_body(body: &str) -> (Vec<u8>, Vec<Finding>) {
     (clean.into_bytes(), reds)
 }
 
-/// Redact secrets/PII inside the model's response (each choice's content).
-fn redact_response_body(body: &[u8]) -> (Vec<u8>, Vec<Finding>) {
+/// Clean the model's response: redact secrets/PII (LLM02), neutralize unsafe
+/// output (LLM05), and catch a leaked system-prompt canary (LLM07).
+fn redact_response_body(body: &[u8], canary: Option<&str>) -> (Vec<u8>, Vec<Finding>) {
     let text = match std::str::from_utf8(body) {
         Ok(t) => t,
         Err(_) => return (body.to_vec(), Vec::new()),
@@ -549,7 +586,7 @@ fn redact_response_body(body: &[u8]) -> (Vec<u8>, Vec<Finding>) {
                     .get("message")
                     .and_then(|m| m.get("content"))
                     .and_then(|c| c.as_str())
-                    .map(redact);
+                    .map(|content| clean_reply_content(content, canary));
                 if let Some((clean, reds)) = cleaned {
                     all.extend(reds);
                     if let Some(msg) = choice.get_mut("message") {
@@ -562,6 +599,102 @@ fn redact_response_body(body: &[u8]) -> (Vec<u8>, Vec<Finding>) {
         }
     }
     (body.to_vec(), Vec::new())
+}
+
+/// Run all reply-side checks on one message's content.
+fn clean_reply_content(content: &str, canary: Option<&str>) -> (String, Vec<Finding>) {
+    // LLM02: secrets / PII
+    let (mut text, mut findings) = redact(content);
+    // LLM05: unsafe output (scripts, iframes, javascript: URIs)
+    let (validated, unsafe_findings) = validate_output(&text);
+    text = validated;
+    findings.extend(unsafe_findings);
+    // LLM07: system-prompt leak (operator-provided canary)
+    if let Some(c) = canary {
+        if !c.is_empty() && text.contains(c) {
+            findings.push(Finding {
+                category: "system_prompt_leak".to_string(),
+                rule: "canary_in_output".to_string(),
+                severity: Severity::High,
+                snippet: "[system-prompt canary detected]".to_string(),
+            });
+            text = text.replace(c, "[REDACTED:system_prompt_leak]");
+        }
+    }
+    (text, findings)
+}
+
+/// LLM05 patterns: content that is dangerous if a UI renders the reply as HTML.
+static UNSAFE_OUTPUT_RULES: Lazy<Vec<(&'static str, Regex)>> = Lazy::new(|| {
+    vec![
+        ("script_tag", Regex::new(r"(?is)<script.*?</script>").unwrap()),
+        ("iframe_tag", Regex::new(r"(?i)<iframe[^>]*>").unwrap()),
+        ("js_uri", Regex::new(r"(?i)javascript:").unwrap()),
+    ]
+});
+
+/// LLM05: neutralize dangerous HTML/JS in the model's reply.
+fn validate_output(text: &str) -> (String, Vec<Finding>) {
+    let mut out = text.to_string();
+    let mut findings = Vec::new();
+    for (name, re) in UNSAFE_OUTPUT_RULES.iter() {
+        let hits: Vec<Finding> = re
+            .find_iter(&out)
+            .map(|m| Finding {
+                category: "unsafe_output".to_string(),
+                rule: name.to_string(),
+                severity: Severity::High,
+                snippet: truncate(m.as_str(), 60),
+            })
+            .collect();
+        if !hits.is_empty() {
+            findings.extend(hits);
+            out = re
+                .replace_all(&out, format!("[REMOVED:{name}]").as_str())
+                .to_string();
+        }
+    }
+    (out, findings)
+}
+
+// ---- LLM10: rate limiting ----
+
+/// Identify the client (by API key or X-Client-Id header), hashed so we never
+/// store the raw credential.
+fn client_key(headers: &HeaderMap) -> u64 {
+    let raw = headers
+        .get("authorization")
+        .or_else(|| headers.get("x-client-id"))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("anonymous");
+    let mut h = DefaultHasher::new();
+    raw.hash(&mut h);
+    h.finish()
+}
+
+/// Fixed 60-second window rate limit. Returns true if the request is allowed.
+fn allow_request(state: &AppState, key: u64) -> bool {
+    let limit = state.config.rate_limit;
+    if limit == 0 {
+        return true; // disabled
+    }
+    // Recover the guard even if a previous holder panicked (no crash).
+    let mut map = state.rate.lock().unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+
+    // Bound memory (DoS defense): if the map grows large, drop expired windows.
+    const RATE_MAP_CAP: usize = 10_000;
+    if map.len() > RATE_MAP_CAP {
+        map.retain(|_, (start, _)| now.duration_since(*start).as_secs() < 60);
+    }
+
+    let entry = map.entry(key).or_insert((now, 0));
+    if now.duration_since(entry.0).as_secs() >= 60 {
+        entry.0 = now;
+        entry.1 = 0;
+    }
+    entry.1 += 1;
+    entry.1 <= limit
 }
 
 fn build_response(status: u16, body: Vec<u8>) -> Response {
@@ -640,6 +773,8 @@ async fn forward(
 pub struct AppState {
     pub config: Arc<Config>,
     pub client: reqwest::Client,
+    /// LLM10: per-client request counters (key -> (window_start, count)).
+    pub rate: Arc<Mutex<HashMap<u64, (Instant, u32)>>>,
 }
 
 #[tokio::main]
@@ -672,6 +807,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         config: Arc::new(config.clone()),
         client: reqwest::Client::new(),
+        rate: Arc::new(Mutex::new(HashMap::new())),
     };
 
     let app = Router::new()
