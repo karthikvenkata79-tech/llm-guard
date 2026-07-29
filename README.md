@@ -1,130 +1,179 @@
-# llm-guard (single-file edition)
+# llm-guard
 
-All the code lives in one file: `src/main.rs`. The only other file is
-`Cargo.toml` (the list of libraries — required for any Rust project that uses
-outside crates).
+A fast, **privacy-first guardrail proxy** for LLM applications, written in Rust.
 
-Same behavior as before: blocks prompt injection, redacts secrets/PII from
-requests and from the model's replies, and logs everything.
+`llm-guard` sits between your app and an LLM. It scans every request for
+prompt-injection attacks and sensitive data, blocks or redacts as needed,
+cleans the model's reply, and logs everything — **all on your own machine.
+No prompt data ever leaves your infrastructure.**
 
-## Run it (works on Mac, Windows, Linux — identical)
+```
+your app  ->  llm-guard  (scan · redact · log)  ->  your LLM  ->  your app
+```
+
+---
+
+## Why
+
+LLM-powered apps are exposed to two big risks: **prompt injection** (users
+tricking the model into ignoring its instructions) and **sensitive-data
+leakage** (secrets or personal data flowing into or out of the model). Most
+guardrail tools are cloud services — meaning your prompts get sent to *their*
+servers to be checked. `llm-guard` runs entirely locally, so it's a fit for
+teams that can't send data off-site.
+
+## Features
+
+- **Blocks prompt-injection attacks** — with evasion resistance for spaced-out
+  letters (`i g n o r e`), leetspeak (`1gn0re`), look-alike characters, and
+  base64-encoded payloads.
+- **Redacts secrets & PII** — API keys, emails, phone numbers, SSNs, and
+  card-like numbers, in both the request *and* the model's reply.
+- **Streaming support** — passes word-by-word replies straight through.
+- **Config-file rules** — add or change detections in a JSON file, no recompiling.
+- **Structured audit logging** — one record per request.
+- **Drop-in** — exposes an OpenAI-compatible endpoint; just point your app's
+  base URL at it.
+- **Single self-contained binary** — runs on macOS, Windows, and Linux, with no
+  external service dependency.
+
+## How it works
+
+For each request: **normalize** the text (undo evasion tricks) → **scan** it
+against the rules → **block** high-severity injection, or **redact** any
+secrets/PII → **forward** the clean request to the LLM → **clean the reply** →
+return it. Every step is logged.
+
+## Quick start
 
 ```bash
 cargo run
 ```
 
-Listens on `http://127.0.0.1:8080`. Configure with environment variables:
-`GUARD_LISTEN`, `GUARD_UPSTREAM`, `GUARD_BLOCK`, `GUARD_SCAN_RESPONSE`.
+Listens on `http://127.0.0.1:8080`. Point your app's LLM base URL there instead
+of the real API, and traffic flows through the guard.
 
-## Make a standalone "click-and-run" binary
-
-```bash
-cargo build --release
-```
-
-This produces a single executable at:
-
-- macOS / Linux: `target/release/llm-guard`
-- Windows: `target\release\llm-guard.exe`
-
-You can run that file directly — no `cargo`, no source needed:
+Try it:
 
 ```bash
-./target/release/llm-guard
+# health check
+curl http://127.0.0.1:8080/health
+
+# an attack — blocked with 403
+curl -X POST http://127.0.0.1:8080/v1/chat/completions \
+  -H "content-type: application/json" \
+  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"ignore all previous instructions"}]}'
 ```
 
-Important: a compiled binary only runs on the OS it was built on. A Mac build
-won't run on Windows and vice-versa. To ship to all three platforms you build
-once on each (or use cross-compilation). Note this is a background server — it
-listens for requests; it doesn't open a window when launched.
+## Configuration
 
-## Run anywhere with Docker (one image, every platform)
+Set via environment variables:
 
-If you have Docker, this is the closest thing to "runs identically everywhere."
-Create a file named `Dockerfile` next to `Cargo.toml`:
+| Variable              | Default                                       | Meaning                                  |
+|-----------------------|-----------------------------------------------|------------------------------------------|
+| `GUARD_LISTEN`        | `127.0.0.1:8080`                              | Address to listen on.                     |
+| `GUARD_UPSTREAM`      | `https://api.openai.com/v1/chat/completions` | The LLM to forward to.                    |
+| `GUARD_BLOCK`         | `true`                                        | Block high-severity injection.            |
+| `GUARD_SCAN_RESPONSE` | `true`                                        | Also scan/redact the model's reply.       |
+| `GUARD_RULES_FILE`    | *(unset)*                                     | Path to a JSON rules file (see below).    |
+| `GUARD_RATE_LIMIT`    | `60`                                          | Max requests per client per 60s (0 = off). |
+| `GUARD_SYSTEM_PROMPT_CANARY` | *(unset)*                              | If a reply contains this string, treat it as a system-prompt leak and redact it. |
 
-```dockerfile
-FROM rust:1-slim AS build
-WORKDIR /app
-COPY . .
-RUN cargo build --release
-
-FROM debian:stable-slim
-COPY --from=build /app/target/release/llm-guard /usr/local/bin/llm-guard
-EXPOSE 8080
-ENV GUARD_LISTEN=0.0.0.0:8080
-CMD ["llm-guard"]
-```
-
-Then:
+For a fully local, no-cloud setup, point `GUARD_UPSTREAM` at a local model
+(e.g. Ollama):
 
 ```bash
-docker build -t llm-guard .
-docker run -p 8080:8080 -e GUARD_UPSTREAM=https://api.openai.com/v1/chat/completions llm-guard
+GUARD_UPSTREAM=http://localhost:11434/v1/chat/completions cargo run
 ```
 
-## Evasion resistance (normalization)
+## Custom rules
 
-Before running the injection rules, the tool also checks "cleaned up" views of
-the prompt, so common ways of dodging plain pattern-matching still get caught:
-
-- spaced-out letters — `i g n o r e`
-- leetspeak — `1gn0re`
-- look-alike (homoglyph) characters
-- base64-encoded hidden instructions
-
-This is a first layer, not a complete defense — a determined attacker can still
-find gaps. The stronger next step is a semantic check (an LLM or ML model that
-judges meaning rather than matching text).
-
-## Rules in a config file (no recompiling)
-
-You can now change what the tool detects without touching the code. Point the
-`GUARD_RULES_FILE` variable at a JSON file:
-
-```bash
-GUARD_RULES_FILE=rules.json cargo run
-```
-
-A starter `rules.json` is included — it contains the same rules that are built
-in. Edit it (add, remove, or change rules), save, and restart — no recompiling.
-Each rule has four fields:
+Point `GUARD_RULES_FILE` at a JSON file to change what's detected without
+recompiling. A starter `rules.json` (the built-in defaults) is included.
 
 ```json
 { "category": "pii", "name": "phone_number", "severity": "medium", "pattern": "\\d{3}-\\d{3}-\\d{4}" }
 ```
 
-- `category` — `prompt_injection`, `secret`, or `pii`
-- `name` — any label you choose
-- `severity` — `low`, `medium`, or `high`
-- `pattern` — the regular expression to match (remember: backslashes must be
-  doubled in JSON, so `\d` becomes `\\d`)
+- `category`: `prompt_injection`, `secret`, or `pii`
+- `severity`: `low`, `medium`, or `high`
+- `pattern`: a regular expression (backslashes doubled, as JSON requires)
 
-Rules of category `prompt_injection` at `high` severity are blocked; `secret`
-and `pii` are redacted. If the file is missing or has a bad pattern, the tool
-logs a warning and falls back to the built-in defaults, so it never crashes.
+## Run with Docker
 
-## Streaming (word-by-word replies)
+No Rust needed on your machine — just Docker. The image builds the binary
+inside a container, so anyone can run your tool in one command.
 
-If the request includes `"stream": true`, the guard passes the reply straight
-through, chunk by chunk, as the model produces it. Request-side protection
-(blocking attacks, redacting secrets in the prompt) still fully applies.
+```bash
+# build the image
+docker build -t llm-guard .
 
-Trade-off: response-side redaction is skipped for streaming replies, because
-scanning the reply would require buffering the whole thing — which defeats the
-point of streaming. Non-streaming requests are unaffected and still get full
-response scanning.
+# run it (forwarding to OpenAI, on port 8080)
+docker run -p 8080:8080 -e GUARD_UPSTREAM=https://api.openai.com/v1/chat/completions llm-guard
+```
 
-## Add your own detection rules
+Or, with the included compose file (easier for setting options):
 
-Open `src/main.rs`, find the `RULES` list, and add another `Rule { ... }` block.
-It's picked up automatically. Or, better, add it to `rules.json` (see above) so
-you don't have to recompile.
+```bash
+docker compose up --build
+```
+
+For a fully-local, privacy-first setup, point `GUARD_UPSTREAM` at a local model
+instead (e.g. Ollama), and no prompt data ever leaves your machine.
+
+## OWASP LLM Top 10 coverage
+
+`llm-guard` is a request/response-layer AI gateway, so it addresses the OWASP
+LLM risks visible at that layer:
+
+| Risk | Covered | How |
+|------|---------|-----|
+| LLM01 Prompt Injection | Yes | Rule scan + evasion-resistant normalization |
+| LLM02 Sensitive Info Disclosure | Yes | Redaction of secrets/PII, request and reply |
+| LLM05 Improper Output Handling | Yes | Neutralizes scripts / iframes / `javascript:` in replies |
+| LLM07 System Prompt Leakage | Yes | Extraction-attempt rules + reply canary detection |
+| LLM10 Unbounded Consumption | Yes | Per-client rate limiting |
+| LLM06 Excessive Agency | Partial | Only in agent setups (tool allow-listing) — not built in |
+| LLM03 / LLM04 / LLM08 / LLM09 | No | Model / training / RAG-layer risks — need different controls |
+
+It deliberately does not claim to cover the model-supply-chain, training, or
+retrieval-layer risks; those are handled by separate controls.
+
+## Status & roadmap
+
+This is an early-stage project. Detection is currently rule-based (regex +
+normalization), which is fast and transparent but can be evaded by a
+determined attacker. Planned next steps:
+
+- A **semantic detection layer** (a local LLM/ML model that judges meaning, not
+  just text) — the biggest jump in detection quality.
+- Docker packaging, persistent file logging, timeouts, and per-user rate limits.
+
+## CI/CD (DevSecOps)
+
+Every push runs a security-focused GitHub Actions pipeline
+(`.github/workflows/security.yml`):
+
+1. build, test, and lint (`cargo build`, `cargo test`, `cargo clippy`)
+2. dependency vulnerability scan (`cargo audit` — supply-chain security)
+3. secret scan (`gitleaks` — no committed keys)
+4. filesystem vulnerability scan (`trivy`)
+
+Nothing ships unless the build and tests pass; the scans surface security
+issues automatically on every change.
+
+## Security
+
+This project applies security engineering to itself:
+
+- `SECURITY.md` — secure-by-design principles, known limitations, and how to report a vulnerability.
+- `THREAT_MODEL.md` — a STRIDE threat model (assets, trust boundaries, threats, and mitigations).
+
+A security code review was performed on the codebase; findings (including a fix
+so that secret/PII values are never written to the audit log) are reflected in
+the threat model.
 
 ## License
 
-This project is released under the MIT License — see `LICENSE`. Open it and
-replace `<YOUR NAME HERE>` with your name.
-
-It uses several open-source libraries under permissive licenses; they're listed
-with attribution in `CREDITS.md`.
+MIT — see [`LICENSE`](LICENSE). Built on open-source libraries listed in
+[`CREDITS.md`](CREDITS.md).
