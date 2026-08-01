@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: llm-guard
+  labels:
+    app: llm-guard
+spec:
+  # ClusterIP: reachable only inside the cluster (not exposed publicly).
+  type: ClusterIP
+  selector:
+    app: llm-guard
+  ports:
+    - port: 8080
+      targetPort: 8080
+      protocol: TCP

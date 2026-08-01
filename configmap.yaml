@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: llm-guard-config
+data:
+  # Non-secret settings live in a ConfigMap.
+  GUARD_LISTEN: "0.0.0.0:8080"
+  GUARD_UPSTREAM: "https://api.openai.com/v1/chat/completions"
+  GUARD_BLOCK: "true"
+  GUARD_SCAN_RESPONSE: "true"
+  GUARD_RATE_LIMIT: "60"

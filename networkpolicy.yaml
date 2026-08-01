@@ -1,0 +1,27 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: llm-guard-netpol
+spec:
+  # Applies to the guard pods.
+  podSelector:
+    matchLabels:
+      app: llm-guard
+  policyTypes:
+    - Ingress
+    - Egress
+  # ---- Ingress: only allow traffic to port 8080 ----
+  ingress:
+    - ports:
+        - port: 8080
+          protocol: TCP
+  # ---- Egress: allow DNS + outbound HTTPS (to reach the LLM API) ----
+  egress:
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    - ports:
+        - port: 443
+          protocol: TCP
