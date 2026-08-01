@@ -1,0 +1,69 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-guard
+  labels:
+    app: llm-guard
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: llm-guard
+  template:
+    metadata:
+      labels:
+        app: llm-guard
+    spec:
+      # ---- Pod-level security hardening ----
+      securityContext:
+        runAsNonRoot: true          # never run as root
+        runAsUser: 10001            # the user we created in the Dockerfile
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault      # restrict syscalls to a safe default set
+      containers:
+        - name: llm-guard
+          image: llm-guard:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          # ---- Config from ConfigMap + Secret ----
+          envFrom:
+            - configMapRef:
+                name: llm-guard-config
+            - secretRef:
+                name: llm-guard-secret
+          # ---- Container-level security hardening ----
+          securityContext:
+            allowPrivilegeEscalation: false   # can't gain more privileges
+            readOnlyRootFilesystem: true      # filesystem is read-only
+            capabilities:
+              drop: ["ALL"]                   # drop all Linux capabilities
+          # ---- Resource limits (prevents one pod starving the node) ----
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "250m"
+              memory: "128Mi"
+          # ---- Health checks ----
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          # ---- Writable /tmp (root fs is read-only) ----
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

@@ -1,0 +1,17 @@
+{
+  "rules": [
+    { "category": "prompt_injection", "name": "ignore_previous_instructions", "severity": "high", "pattern": "(?i)ignore\\s+(all\\s+)?(previous|prior|above|earlier)\\s+(instructions|prompts|context|rules)" },
+    { "category": "prompt_injection", "name": "disregard_instructions", "severity": "high", "pattern": "(?i)(disregard|forget|override)\\s+(all\\s+)?(your\\s+)?(previous\\s+|prior\\s+|the\\s+)?(instructions|rules|system\\s+prompt)" },
+    { "category": "prompt_injection", "name": "reveal_system_prompt", "severity": "high", "pattern": "(?i)(reveal|show|print|repeat|display|output)\\s+(me\\s+)?(your\\s+)?(the\\s+)?(system\\s+prompt|initial\\s+instructions|your\\s+instructions)" },
+    { "category": "prompt_injection", "name": "role_override", "severity": "medium", "pattern": "(?i)(you\\s+are\\s+now|from\\s+now\\s+on\\s+you|pretend\\s+to\\s+be|act\\s+as\\s+(if\\s+you\\s+are\\s+)?)\\b" },
+    { "category": "prompt_injection", "name": "jailbreak_dan", "severity": "medium", "pattern": "(?i)\\b(DAN|do\\s+anything\\s+now|developer\\s+mode|jailbreak)\\b" },
+    { "category": "prompt_injection", "name": "repeat_words_above", "severity": "high", "pattern": "(?i)(repeat|print|output|show|tell\\s+me)\\s+(the\\s+)?(words|text|everything|content|instructions|prompt)\\s+(above|before)" },
+    { "category": "secret", "name": "openai_api_key", "severity": "high", "pattern": "sk-[A-Za-z0-9_-]{20,}" },
+    { "category": "secret", "name": "aws_access_key_id", "severity": "high", "pattern": "AKIA[0-9A-Z]{16}" },
+    { "category": "secret", "name": "bearer_token", "severity": "medium", "pattern": "(?i)bearer\\s+[A-Za-z0-9._-]{16,}" },
+    { "category": "pii", "name": "email_address", "severity": "low", "pattern": "[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}" },
+    { "category": "pii", "name": "phone_number", "severity": "medium", "pattern": "\\b(\\+?\\d{1,3}[\\s.-]?)?\\(?\\d{3}\\)?[\\s.-]?\\d{3}[\\s.-]?\\d{4}\\b" },
+    { "category": "pii", "name": "us_ssn", "severity": "medium", "pattern": "\\b\\d{3}-\\d{2}-\\d{4}\\b" },
+    { "category": "pii", "name": "credit_card_like", "severity": "medium", "pattern": "\\b(?:\\d[ -]*?){13,16}\\b" }
+  ]
+}
